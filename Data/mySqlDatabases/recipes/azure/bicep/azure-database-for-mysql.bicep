@@ -1,8 +1,3 @@
-extension kubernetes with {
-  kubeConfig: ''
-  namespace: context.runtime.kubernetes.namespace
-} as kubernetes
-
 //////////////////////////////////////////
 // Common Radius variables
 //////////////////////////////////////////
@@ -21,16 +16,76 @@ var location string = resourceGroup().location
 
 var dbSecretName = context.resource.properties.secretName
 
-resource dbCredentials 'core/Secret@v1' existing = {
-  metadata: {
-    name: dbSecretName
-    namespace: context.runtime.kubernetes.namespace
+// Reconstruct the Radius.Security/secrets resource ID from this resource's own ID, since both
+// share the same resource group path prefix and the secretName property is only a plain name.
+var secretResourceId = replace(
+  context.resource.id,
+  'Radius.Data/mySqlDatabases/${context.resource.name}',
+  'Radius.Security/secrets/${dbSecretName}'
+)
+
+// Must match the vault naming scheme used by the azure-key-vault-secrets.bicep secrets Recipe.
+var vaultName = take('${dbSecretName}-kv-${uniqueString(secretResourceId, resourceGroup().id)}', 24)
+
+resource vault 'Microsoft.KeyVault/vaults@2026-02-01' existing = {
+  name: vaultName
+}
+
+// The underlying Microsoft.DBforMySQL/flexibleServers administratorLogin property is a plain
+// (non-secure) string, and Bicep's getSecret() can only be assigned directly to a @secure()
+// module parameter. To still source the login name from Key Vault, a deployment script reads the
+// USERNAME secret at deployment time via the Azure CLI and exposes it as a plain-string output.
+resource scriptIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${resourceName}-script-identity'
+  location: location
+}
+
+// Key Vault Secrets User: built-in role granting data-plane 'get'/'list' access to secrets.
+var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
+
+// The vault uses RBAC authorization (see azure-key-vault-secrets.bicep), so the script identity
+// needs a role assignment scoped to the vault rather than an access policy entry.
+resource vaultSecretsUserRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(vault.id, scriptIdentity.id, keyVaultSecretsUserRoleId)
+  scope: vault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
+    principalId: scriptIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
-// Kubernetes stores Secret data base64-encoded, so it must be decoded before use.
-var adminUsername = base64ToString(dbCredentials.data.USERNAME)
-var adminPassword = base64ToString(dbCredentials.data.PASSWORD)
+resource getUsernameScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
+  name: '${resourceName}-get-username'
+  location: location
+  kind: 'AzureCLI'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${scriptIdentity.id}': {}
+    }
+  }
+  properties: {
+    azCliVersion: '2.62.0'
+    retentionInterval: 'PT1H'
+    timeout: 'PT5M'
+    cleanupPreference: 'OnSuccess'
+    environmentVariables: [
+      {
+        name: 'VAULT_NAME'
+        value: vaultName
+      }
+    ]
+    scriptContent: '''
+      set -e
+      username=$(az keyvault secret show --vault-name "$VAULT_NAME" --name USERNAME --query value -o tsv)
+      echo "{\"username\":\"$username\"}" > "$AZ_SCRIPTS_OUTPUT_PATH"
+    '''
+  }
+  dependsOn: [
+    vaultSecretsUserRoleAssignment
+  ]
+}
 
 var database = context.resource.properties.?database ?? 'mysql_db'
 
@@ -75,8 +130,8 @@ module flexibleServer 'br/public:avm/res/db-for-my-sql/flexible-server:0.10.3' =
     // Non-required parameters
     tags: labels
     location: location
-    administratorLogin: adminUsername
-    administratorLoginPassword: adminPassword
+    administratorLogin: getUsernameScript.properties.outputs.username
+    administratorLoginPassword: vault.getSecret('PASSWORD')
     storageAutoIoScaling: 'Enabled'
     storageSizeGB: 32
     version: mysqlVersionMap[version]

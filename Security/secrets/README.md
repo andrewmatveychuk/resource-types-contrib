@@ -11,6 +11,8 @@ A list of available Recipes for this Resource Type, including links to the Bicep
 |---|---|---|---|
 | Kubernetes | Bicep | recipes/kubernetes/bicep/kubernetes-secrets.bicep | Alpha |
 | Kubernetes | Terraform | recipes/kubernetes/terraform/main.tf | Alpha |
+| Azure | Bicep | recipes/azure/bicep/azure-key-vault.bicep | Alpha |
+| Azure | Terraform | recipes/azure/terraform/main.tf | Alpha |
 
 
 ## Recipe Input Properties
